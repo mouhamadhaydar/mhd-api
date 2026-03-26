@@ -5,16 +5,14 @@ import io
 import os
 import re
 import torch
+import numpy as np
 
 app = Flask(__name__)
 
-# Optional: helps small CPU instances
 torch.set_num_threads(1)
 
-# EasyOCR model folder
 MODEL_DIR = os.environ.get("EASYOCR_MODULE_PATH", "/opt/render/project/src/.EasyOCR")
 
-# Load OCR reader once at startup
 reader = easyocr.Reader(
     ['en'],
     gpu=False,
@@ -31,7 +29,9 @@ def preprocess_image(file_bytes):
         img = img.resize((max_w, int(img.height * ratio)))
 
     img = ImageOps.autocontrast(img)
-    return img
+
+    # Convert PIL image to numpy array for EasyOCR
+    return np.array(img)
 
 def extract_fields(lines):
     text = " ".join(lines)
@@ -83,10 +83,10 @@ def ocr():
         }), 400
 
     try:
-        img = preprocess_image(data)
+        img_array = preprocess_image(data)
 
         result = reader.readtext(
-            img,
+            img_array,
             detail=0,
             paragraph=False,
             batch_size=1
