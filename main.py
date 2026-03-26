@@ -1,17 +1,22 @@
 from flask import Flask, request, jsonify
-import easyocr
-import os
 
-app = Flask(__name__)   # ✅ define first
-
-reader = easyocr.Reader(['en'])
+app = Flask(__name__)
 
 @app.route("/")
 def home():
     return "OCR API is running 🚀"
 
-@app.route("/ocr", methods=["POST"])
+@app.route("/ocr", methods=["GET", "POST"])
 def ocr():
+    if request.method == "GET":
+        return """
+        <h2>OCR Upload</h2>
+        <form method="post" enctype="multipart/form-data">
+            <input type="file" name="file">
+            <button type="submit">Upload</button>
+        </form>
+        """
+
     if 'file' not in request.files:
         return jsonify({"success": False, "error": "No file uploaded"})
 
@@ -19,11 +24,9 @@ def ocr():
     filepath = "temp.jpg"
     file.save(filepath)
 
-    result = reader.readtext(filepath, detail=0)
-
     return jsonify({
         "success": True,
-        "text": result
+        "message": "File uploaded successfully"
     })
 
 if __name__ == "__main__":
