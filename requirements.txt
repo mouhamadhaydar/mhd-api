@@ -1,3 +1,5 @@
 easyocr
 pillow
 torch
+gunicorn
+flask
