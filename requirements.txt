@@ -3,3 +3,5 @@ gunicorn
 easyocr==1.7.2
 pillow
 torch
+numpy
+openpyxl
