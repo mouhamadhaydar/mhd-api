@@ -1,7 +1,7 @@
 flask
-gunicorn
-easyocr==1.7.2
 pillow
+easyocr
 torch
 numpy
-openpyxl
+pandas
+rapidfuzz
