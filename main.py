@@ -51,7 +51,21 @@ def clean_text(text):
 # LOAD ITEMS CSV
 # ----------------------------
 def load_items(csv_file):
-    df = pd.read_csv(csv_file)
+    encodings_to_try = ['utf-8', 'utf-8-sig', 'cp1252', 'latin1']
+
+    last_error = None
+    df = None
+
+    for enc in encodings_to_try:
+        try:
+            df = pd.read_csv(csv_file, encoding=enc, encoding_errors='ignore')
+            break
+        except Exception as e:
+            last_error = e
+
+    if df is None:
+        raise ValueError(f"Could not read CSV file with supported encodings. Last error: {last_error}")
+
     df.columns = df.columns.str.strip().str.lower()
 
     possible_code_cols = ['item_code', 'itemcode', 'code', 'sku']
