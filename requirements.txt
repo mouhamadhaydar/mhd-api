@@ -1,7 +1,10 @@
 flask
+gunicorn
 pillow
 easyocr
 torch
+torchvision
 numpy
 pandas
 rapidfuzz
+opencv-python-headless
