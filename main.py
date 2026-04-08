@@ -24,16 +24,13 @@ reader = easyocr.Reader(
     download_enabled=True
 )
 
+# ----------------------------
+# IMAGE PROCESSING
+# ----------------------------
 def preprocess_image(file_bytes):
     img = Image.open(io.BytesIO(file_bytes)).convert("L")
     img = ImageOps.autocontrast(img)
     return np.array(img)
-
-def clean_text(text):
-    text = str(text).lower()
-    text = re.sub(r'[^a-z0-9\s./-]', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
 
 def extract_text_from_bytes(file_bytes):
     img = preprocess_image(file_bytes)
@@ -41,6 +38,18 @@ def extract_text_from_bytes(file_bytes):
     full_text = " ".join(results).strip()
     return full_text, results
 
+# ----------------------------
+# CLEAN TEXT
+# ----------------------------
+def clean_text(text):
+    text = str(text).lower()
+    text = re.sub(r'[^a-z0-9\s./-]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+# ----------------------------
+# LOAD ITEMS CSV
+# ----------------------------
 def load_items(csv_file):
     df = pd.read_csv(csv_file)
     df.columns = df.columns.str.strip().str.lower()
@@ -63,33 +72,44 @@ def load_items(csv_file):
         df['combined'] = df[code_col].fillna('').astype(str)
 
     df['combined'] = df['combined'].apply(clean_text)
+
     return df, code_col, desc_col
 
+# ----------------------------
+# DETECT ITEM CODE
+# ----------------------------
 def detect_code_from_text(raw_text):
     text = str(raw_text).upper()
 
     patterns = [
-        r'\b([A-Z]{1,5}-\d{2,10})\b',
-        r'\b([A-Z]{2,10}\.\d{2,10})\b',
-        r'\b([A-Z]{2,10}\d{2,10})\b'
+        r'\b([A-Z]{2,10}\.\d{2,10})\b',   # RML.12058
+        r'\b([A-Z]{1,5}-\d{2,10})\b',     # SS-683
+        r'\b([A-Z]{2,10}\d{2,10})\b'      # IPC00025
     ]
 
     for pattern in patterns:
         m = re.search(pattern, text)
         if m:
             return m.group(1)
+
     return ''
 
+# ----------------------------
+# DETECT GTIN
+# ----------------------------
 def detect_gtin(raw_text):
     text = re.sub(r'[^0-9]', ' ', str(raw_text))
     candidates = re.findall(r'\b\d{8}\b|\b\d{12}\b|\b\d{13}\b|\b\d{14}\b', text)
     return candidates[0] if candidates else ''
 
+# ----------------------------
+# DETECT EXPIRY DATE
+# ----------------------------
 def detect_expiry_date(raw_text):
     text = str(raw_text)
 
     patterns = [
-        r'\b(20\d{2}-\d{2}-\d{2})\b',   # YYYY-MM-DD (priority)
+        r'\b(20\d{2}-\d{2}-\d{2})\b',
         r'\b(0[1-9]|1[0-2])[\/\-](20\d{2})\b',
         r'\b(0[1-9]|[12][0-9]|3[01])[\/\-](0[1-9]|1[0-2])[\/\-](20\d{2})\b'
     ]
@@ -101,10 +121,12 @@ def detect_expiry_date(raw_text):
 
     return ''
 
+# ----------------------------
+# DETECT BATCH (FINAL FIXED)
+# ----------------------------
 def detect_batch(raw_text):
     text = str(raw_text).upper()
 
-    # Step 1: labeled batch (best case)
     labeled_patterns = [
         r'\b(?:BATCH|LOT|LOT NO|LOT NUMBER|BN|LN)[\s:.\-]*([A-Z0-9\-\/]{4,30})\b'
     ]
@@ -114,34 +136,63 @@ def detect_batch(raw_text):
         if m:
             return m.group(1).strip()
 
-    # Step 2: fallback (smart filtering)
-    tokens = re.findall(r'\b[A-Z0-9\-]{5,20}\b', text)
+    detected_code = detect_code_from_text(text)
+    detected_gtin = detect_gtin(text)
+    detected_expiry = detect_expiry_date(text)
+
+    tokens = re.findall(r'\b[A-Z0-9.\-\/]{5,20}\b', text)
+
+    skip_words = {
+        'COVIDIEN', 'SOFSILK', 'RELIAPOINT', 'CUTTING', 'BLACK',
+        'METRIC', 'BRAIDED', 'COATED', 'STAINLESS', 'STEEL',
+        'RAMEEM', 'MEDICA', 'ARABIA', 'KINGDOM', 'SAUDI'
+    }
+
+    skip_exact_tokens = {'C-13'}
 
     for token in tokens:
-        # skip GTIN
+        if token in skip_words or token in skip_exact_tokens:
+            continue
+        if token == detected_code:
+            continue
+        if token == detected_gtin:
+            continue
+        if token == detected_expiry:
+            continue
+
         if re.fullmatch(r'\d{8,14}', token):
             continue
-
-        # skip date
         if re.fullmatch(r'20\d{2}-\d{2}-\d{2}', token):
             continue
-
-        # skip item code
         if re.fullmatch(r'[A-Z]{1,5}-\d{2,10}', token):
             continue
+        if re.fullmatch(r'[A-Z]{2,10}\.\d{2,10}', token):
+            continue
+        if re.fullmatch(r'[A-Z]{2,10}\d{2,10}', token):
+            continue
+        if re.fullmatch(r'\d+(\.\d+)?(MM|CM|M)?', token):
+            continue
+        if re.fullmatch(r'\d+/\d+', token):
+            continue
+        if re.fullmatch(r'[A-Z]-\d{1,3}', token):
+            continue
 
-        # must contain letters + numbers
-        if re.search(r'[A-Z]', token) and re.search(r'\d', token):
+        if len(token) >= 6 and re.search(r'[A-Z]', token) and re.search(r'\d', token):
             return token
 
     return ''
 
+# ----------------------------
+# MATCHING
+# ----------------------------
 def find_exact_code_match(detected_code, df, code_col):
     if not detected_code:
         return None
+
     matches = df[df[code_col].astype(str).str.upper() == detected_code.upper()]
     if not matches.empty:
         return matches.iloc[0]
+
     return None
 
 def find_best_match(ocr_text, df):
@@ -156,6 +207,9 @@ def find_best_match(ocr_text, df):
 
     return best_row, best_score
 
+# ----------------------------
+# ROUTES
+# ----------------------------
 @app.route("/")
 def home():
     return "OCR + Item Match API is running 🚀"
@@ -168,9 +222,6 @@ def ocr():
 
         file = request.files["file"]
         file_bytes = file.read()
-
-        if not file_bytes:
-            return jsonify({"success": False, "error": "Empty file"}), 400
 
         raw_text, lines = extract_text_from_bytes(file_bytes)
 
@@ -193,17 +244,8 @@ def match_item():
         if "file" not in request.files:
             return jsonify({"success": False, "error": "No file uploaded"}), 400
 
-        if not os.path.exists(CSV_FILE_PATH):
-            return jsonify({
-                "success": False,
-                "error": f"CSV file not found on server: {CSV_FILE_PATH}"
-            }), 500
-
         file = request.files["file"]
         file_bytes = file.read()
-
-        if not file_bytes:
-            return jsonify({"success": False, "error": "Empty file"}), 400
 
         raw_text, lines = extract_text_from_bytes(file_bytes)
         cleaned_text = clean_text(raw_text)
@@ -216,49 +258,42 @@ def match_item():
         df, code_col, desc_col = load_items(CSV_FILE_PATH)
 
         exact_row = find_exact_code_match(detected_code, df, code_col)
+
         if exact_row is not None:
             return jsonify({
                 "success": True,
                 "ocr_text": raw_text,
-                "lines": lines,
-                "cleaned_text": cleaned_text,
                 "detected_code": detected_code,
                 "batch": detected_batch,
                 "expiry_date": detected_expiry,
                 "gtin": detected_gtin,
                 "matched_item_code": str(exact_row[code_col]),
                 "matched_description": str(exact_row[desc_col]) if desc_col else "",
-                "match_score": 100.0,
-                "match_type": "exact_code"
+                "match_score": 100,
+                "match_type": "exact"
             })
 
         best_row, best_score = find_best_match(cleaned_text, df)
 
-        result = {
+        return jsonify({
             "success": True,
             "ocr_text": raw_text,
-            "lines": lines,
-            "cleaned_text": cleaned_text,
             "detected_code": detected_code,
             "batch": detected_batch,
             "expiry_date": detected_expiry,
             "gtin": detected_gtin,
-            "matched_item_code": "",
-            "matched_description": "",
+            "matched_item_code": str(best_row[code_col]) if best_row is not None else "",
+            "matched_description": str(best_row[desc_col]) if desc_col and best_row is not None else "",
             "match_score": round(float(best_score), 2),
             "match_type": "fuzzy"
-        }
-
-        if best_row is not None:
-            result["matched_item_code"] = str(best_row[code_col])
-            if desc_col:
-                result["matched_description"] = str(best_row[desc_col])
-
-        return jsonify(result)
+        })
 
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
+# ----------------------------
+# RUN
+# ----------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
