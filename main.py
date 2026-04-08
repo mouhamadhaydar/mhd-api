@@ -333,6 +333,9 @@ def match_item():
 
         df, code_col, desc_col, gtin_col = load_items(CSV_FILE_PATH)
 
+        # Minimum fuzzy score to accept a CSV match
+        MIN_MATCH_SCORE = 70
+
         # 1) GTIN exact match
         gtin_row = find_exact_gtin_match(detected_gtin, df, gtin_col)
         if gtin_row is not None:
@@ -370,13 +373,25 @@ def match_item():
         # 3) fuzzy compare against CSV
         best_row, best_score, best_match_basis = find_best_item_match(raw_text, df, code_col, desc_col)
 
-        matched_item_code = ""
-        matched_description = ""
+        # 4) if score too low => unknown product
+        if best_row is None or float(best_score) < MIN_MATCH_SCORE:
+            return jsonify({
+                "success": True,
+                "ocr_text": raw_text,
+                "lines": lines,
+                "detected_code": detected_code,
+                "matched_item_code": "UNKNOWN PRODUCT",
+                "matched_description": "UNKNOWN PRODUCT",
+                "batch": detected_batch,
+                "expiry_date": detected_expiry,
+                "gtin": detected_gtin,
+                "match_score": round(float(best_score), 2) if best_row is not None else 0,
+                "match_type": "unknown_product"
+            })
 
-        if best_row is not None:
-            matched_item_code = str(best_row[code_col])
-            if desc_col:
-                matched_description = str(best_row[desc_col])
+        # 5) valid fuzzy match
+        matched_item_code = str(best_row[code_col])
+        matched_description = str(best_row[desc_col]) if desc_col else ""
 
         return jsonify({
             "success": True,
@@ -394,8 +409,6 @@ def match_item():
 
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-
-
 # RUN
 # ----------------------------
 if __name__ == "__main__":
