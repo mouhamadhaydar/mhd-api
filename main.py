@@ -5,10 +5,13 @@ import io
 import os
 import torch
 import numpy as np
+import re
+import pandas as pd
+from rapidfuzz import fuzz
 
 app = Flask(__name__)
 
-# Limit CPU usage (important for GoDaddy / Render)
+# Limit CPU usage
 torch.set_num_threads(1)
 
 MODEL_DIR = os.environ.get("EASYOCR_MODULE_PATH", "/opt/render/project/src/.EasyOCR")
@@ -20,13 +23,91 @@ reader = easyocr.Reader(
     download_enabled=True
 )
 
+# Default CSV path
+CSV_FILE_PATH = os.environ.get("ITEMS_CSV_PATH", "items.csv")
+
+
 # -----------------------------
 # Image Preprocessing
 # -----------------------------
 def preprocess_image(file_bytes):
-    img = Image.open(io.BytesIO(file_bytes)).convert("L")  # grayscale
+    img = Image.open(io.BytesIO(file_bytes)).convert("L")
     img = ImageOps.autocontrast(img)
     return np.array(img)
+
+
+# -----------------------------
+# Text Cleaning
+# -----------------------------
+def clean_text(text):
+    text = str(text).lower()
+    text = re.sub(r'[^a-z0-9\s]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+# -----------------------------
+# OCR from uploaded bytes
+# -----------------------------
+def extract_text_from_bytes(file_bytes):
+    img = preprocess_image(file_bytes)
+    results = reader.readtext(img, detail=0, paragraph=True)
+    full_text = " ".join(results).strip()
+    return full_text, results
+
+
+# -----------------------------
+# Load CSV items
+# -----------------------------
+def load_items(csv_file):
+    df = pd.read_csv(csv_file)
+    df.columns = df.columns.str.strip().str.lower()
+
+    possible_code_cols = ['item_code', 'itemcode', 'code', 'sku']
+    possible_desc_cols = ['description', 'item_name', 'name', 'item', 'displayname']
+
+    code_col = next((c for c in possible_code_cols if c in df.columns), None)
+    desc_col = next((c for c in possible_desc_cols if c in df.columns), None)
+
+    if not code_col:
+        raise ValueError(f"No item code column found. CSV columns: {list(df.columns)}")
+
+    if desc_col:
+        df['combined'] = (
+            df[code_col].fillna('').astype(str) + ' ' +
+            df[desc_col].fillna('').astype(str)
+        )
+    else:
+        df['combined'] = df[code_col].fillna('').astype(str)
+
+    df['combined'] = df['combined'].apply(clean_text)
+
+    return df, code_col, desc_col
+
+
+# -----------------------------
+# Detect item code directly from OCR text
+# -----------------------------
+def detect_code_from_text(raw_text):
+    m = re.search(r'\b[A-Z]{2,5}[0-9]{3,10}\b', str(raw_text).upper())
+    return m.group(0) if m else ''
+
+
+# -----------------------------
+# Find best fuzzy match
+# -----------------------------
+def find_best_match(ocr_text, df):
+    best_score = 0
+    best_row = None
+
+    for _, row in df.iterrows():
+        score = fuzz.partial_ratio(ocr_text, row['combined'])
+        if score > best_score:
+            best_score = score
+            best_row = row
+
+    return best_row, best_score
+
 
 # -----------------------------
 # OCR API (TEXT ONLY)
@@ -49,18 +130,75 @@ def ocr():
                 "error": "Empty file"
             }), 400
 
-        img = preprocess_image(file_bytes)
-
-        # 🔥 OCR ONLY (no extraction)
-        results = reader.readtext(img, detail=0, paragraph=True)
-
-        full_text = " ".join(results).strip()
+        full_text, lines = extract_text_from_bytes(file_bytes)
 
         return jsonify({
             "success": True,
             "text": full_text,
-            "lines": results
+            "lines": lines
         })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+# -----------------------------
+# OCR + Match Item from CSV
+# -----------------------------
+@app.route("/match-item", methods=["POST"])
+def match_item():
+    try:
+        if "file" not in request.files:
+            return jsonify({
+                "success": False,
+                "error": "No file uploaded"
+            }), 400
+
+        file = request.files["file"]
+        file_bytes = file.read()
+
+        if not file_bytes:
+            return jsonify({
+                "success": False,
+                "error": "Empty file"
+            }), 400
+
+        # Optional CSV path from request form-data
+        csv_path = request.form.get("csv_path", CSV_FILE_PATH)
+
+        if not os.path.exists(csv_path):
+            return jsonify({
+                "success": False,
+                "error": f"CSV file not found: {csv_path}"
+            }), 400
+
+        raw_text, lines = extract_text_from_bytes(file_bytes)
+        cleaned_text = clean_text(raw_text)
+
+        df, code_col, desc_col = load_items(csv_path)
+        best_row, best_score = find_best_match(cleaned_text, df)
+        detected_code = detect_code_from_text(raw_text)
+
+        result = {
+            "success": True,
+            "ocr_text": raw_text,
+            "lines": lines,
+            "cleaned_text": cleaned_text,
+            "detected_code": detected_code,
+            "matched_item_code": "",
+            "matched_description": "",
+            "match_score": round(float(best_score), 2)
+        }
+
+        if best_row is not None:
+            result["matched_item_code"] = str(best_row[code_col])
+            if desc_col:
+                result["matched_description"] = str(best_row[desc_col])
+
+        return jsonify(result)
 
     except Exception as e:
         return jsonify({
@@ -71,7 +209,7 @@ def ocr():
 
 @app.route("/")
 def home():
-    return "OCR TEXT API is running 🚀"
+    return "OCR + Item Match API is running 🚀"
 
 
 if __name__ == "__main__":
