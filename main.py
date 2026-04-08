@@ -31,7 +31,7 @@ def preprocess_image(file_bytes):
 
 def clean_text(text):
     text = str(text).lower()
-    text = re.sub(r'[^a-z0-9\s]', ' ', text)
+    text = re.sub(r'[^a-z0-9\s./-]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
@@ -69,6 +69,62 @@ def detect_code_from_text(raw_text):
     m = re.search(r'\b[A-Z]{2,5}[0-9]{3,10}\b', str(raw_text).upper())
     return m.group(0) if m else ''
 
+def detect_gtin(raw_text):
+    text = re.sub(r'[^0-9]', ' ', str(raw_text))
+    candidates = re.findall(r'\b\d{8}\b|\b\d{12}\b|\b\d{13}\b|\b\d{14}\b', text)
+    return candidates[0] if candidates else ''
+
+def detect_expiry_date(raw_text):
+    text = str(raw_text)
+
+    patterns = [
+        r'\b(0[1-9]|1[0-2])[\/\-](20\d{2})\b',                      # MM/YYYY or MM-YYYY
+        r'\b(0[1-9]|[12][0-9]|3[01])[\/\-](0[1-9]|1[0-2])[\/\-](20\d{2})\b',  # DD/MM/YYYY
+        r'\b(20\d{2})[\/\-](0[1-9]|1[0-2])[\/\-](0[1-9]|[12][0-9]|3[01])\b'   # YYYY/MM/DD
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            return m.group(0)
+
+    mfg_match = re.search(r'\b(mfg|exp|expiry|expire|use by|best before)\b[:\s-]*([A-Za-z0-9/\-]+)', text, re.IGNORECASE)
+    if mfg_match:
+        return mfg_match.group(2)
+
+    return ''
+
+def detect_batch(raw_text):
+    text = str(raw_text)
+
+    labeled_patterns = [
+        r'\b(?:batch|lot|lot no|lot number|batch no|batch number)[\s:.\-]*([A-Z0-9\-\/]{4,30})\b',
+        r'\b(?:bn|ln)[\s:.\-]*([A-Z0-9\-\/]{4,30})\b'
+    ]
+
+    for pattern in labeled_patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+
+    generic_candidates = re.findall(r'\b[A-Z0-9]{6,20}\b', text.upper())
+
+    skip_values = {
+        'GTIN', 'LOT', 'BATCH', 'EXP', 'EXPIRY', 'MFG', 'RAMEEM',
+        'MEDICA', 'KINGDOM', 'SAUDI', 'ARABIA'
+    }
+
+    for val in generic_candidates:
+        if val in skip_values:
+            continue
+        if re.fullmatch(r'\d{8,14}', val):  # likely GTIN/date-like
+            continue
+        if re.fullmatch(r'[A-Z]{2,5}\d{3,10}', val):  # likely item code
+            continue
+        return val
+
+    return ''
+
 def find_exact_code_match(detected_code, df, code_col):
     if not detected_code:
         return None
@@ -105,12 +161,16 @@ def ocr():
         if not file_bytes:
             return jsonify({"success": False, "error": "Empty file"}), 400
 
-        full_text, lines = extract_text_from_bytes(file_bytes)
+        raw_text, lines = extract_text_from_bytes(file_bytes)
 
         return jsonify({
             "success": True,
-            "text": full_text,
-            "lines": lines
+            "text": raw_text,
+            "lines": lines,
+            "detected_code": detect_code_from_text(raw_text),
+            "batch": detect_batch(raw_text),
+            "expiry_date": detect_expiry_date(raw_text),
+            "gtin": detect_gtin(raw_text)
         })
 
     except Exception as e:
@@ -137,8 +197,12 @@ def match_item():
         raw_text, lines = extract_text_from_bytes(file_bytes)
         cleaned_text = clean_text(raw_text)
 
-        df, code_col, desc_col = load_items(CSV_FILE_PATH)
         detected_code = detect_code_from_text(raw_text)
+        detected_batch = detect_batch(raw_text)
+        detected_expiry = detect_expiry_date(raw_text)
+        detected_gtin = detect_gtin(raw_text)
+
+        df, code_col, desc_col = load_items(CSV_FILE_PATH)
 
         exact_row = find_exact_code_match(detected_code, df, code_col)
         if exact_row is not None:
@@ -148,6 +212,9 @@ def match_item():
                 "lines": lines,
                 "cleaned_text": cleaned_text,
                 "detected_code": detected_code,
+                "batch": detected_batch,
+                "expiry_date": detected_expiry,
+                "gtin": detected_gtin,
                 "matched_item_code": str(exact_row[code_col]),
                 "matched_description": str(exact_row[desc_col]) if desc_col else "",
                 "match_score": 100.0,
@@ -162,6 +229,9 @@ def match_item():
             "lines": lines,
             "cleaned_text": cleaned_text,
             "detected_code": detected_code,
+            "batch": detected_batch,
+            "expiry_date": detected_expiry,
+            "gtin": detected_gtin,
             "matched_item_code": "",
             "matched_description": "",
             "match_score": round(float(best_score), 2),
