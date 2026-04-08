@@ -66,8 +66,19 @@ def load_items(csv_file):
     return df, code_col, desc_col
 
 def detect_code_from_text(raw_text):
-    m = re.search(r'\b[A-Z]{2,5}[0-9]{3,10}\b', str(raw_text).upper())
-    return m.group(0) if m else ''
+    text = str(raw_text).upper()
+
+    patterns = [
+        r'\b([A-Z]{1,5}-\d{2,10})\b',
+        r'\b([A-Z]{2,10}\.\d{2,10})\b',
+        r'\b([A-Z]{2,10}\d{2,10})\b'
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1)
+    return ''
 
 def detect_gtin(raw_text):
     text = re.sub(r'[^0-9]', ' ', str(raw_text))
@@ -78,9 +89,9 @@ def detect_expiry_date(raw_text):
     text = str(raw_text)
 
     patterns = [
-        r'\b(0[1-9]|1[0-2])[\/\-](20\d{2})\b',                      # MM/YYYY or MM-YYYY
-        r'\b(0[1-9]|[12][0-9]|3[01])[\/\-](0[1-9]|1[0-2])[\/\-](20\d{2})\b',  # DD/MM/YYYY
-        r'\b(20\d{2})[\/\-](0[1-9]|1[0-2])[\/\-](0[1-9]|[12][0-9]|3[01])\b'   # YYYY/MM/DD
+        r'\b(20\d{2}-\d{2}-\d{2})\b',   # YYYY-MM-DD (priority)
+        r'\b(0[1-9]|1[0-2])[\/\-](20\d{2})\b',
+        r'\b(0[1-9]|[12][0-9]|3[01])[\/\-](0[1-9]|1[0-2])[\/\-](20\d{2})\b'
     ]
 
     for pattern in patterns:
@@ -88,40 +99,40 @@ def detect_expiry_date(raw_text):
         if m:
             return m.group(0)
 
-    mfg_match = re.search(r'\b(mfg|exp|expiry|expire|use by|best before)\b[:\s-]*([A-Za-z0-9/\-]+)', text, re.IGNORECASE)
-    if mfg_match:
-        return mfg_match.group(2)
-
     return ''
 
 def detect_batch(raw_text):
-    text = str(raw_text)
+    text = str(raw_text).upper()
 
+    # Step 1: labeled batch (best case)
     labeled_patterns = [
-        r'\b(?:batch|lot|lot no|lot number|batch no|batch number)[\s:.\-]*([A-Z0-9\-\/]{4,30})\b',
-        r'\b(?:bn|ln)[\s:.\-]*([A-Z0-9\-\/]{4,30})\b'
+        r'\b(?:BATCH|LOT|LOT NO|LOT NUMBER|BN|LN)[\s:.\-]*([A-Z0-9\-\/]{4,30})\b'
     ]
 
     for pattern in labeled_patterns:
-        m = re.search(pattern, text, re.IGNORECASE)
+        m = re.search(pattern, text)
         if m:
             return m.group(1).strip()
 
-    generic_candidates = re.findall(r'\b[A-Z0-9]{6,20}\b', text.upper())
+    # Step 2: fallback (smart filtering)
+    tokens = re.findall(r'\b[A-Z0-9\-]{5,20}\b', text)
 
-    skip_values = {
-        'GTIN', 'LOT', 'BATCH', 'EXP', 'EXPIRY', 'MFG', 'RAMEEM',
-        'MEDICA', 'KINGDOM', 'SAUDI', 'ARABIA'
-    }
+    for token in tokens:
+        # skip GTIN
+        if re.fullmatch(r'\d{8,14}', token):
+            continue
 
-    for val in generic_candidates:
-        if val in skip_values:
+        # skip date
+        if re.fullmatch(r'20\d{2}-\d{2}-\d{2}', token):
             continue
-        if re.fullmatch(r'\d{8,14}', val):  # likely GTIN/date-like
+
+        # skip item code
+        if re.fullmatch(r'[A-Z]{1,5}-\d{2,10}', token):
             continue
-        if re.fullmatch(r'[A-Z]{2,5}\d{3,10}', val):  # likely item code
-            continue
-        return val
+
+        # must contain letters + numbers
+        if re.search(r'[A-Z]', token) and re.search(r'\d', token):
+            return token
 
     return ''
 
