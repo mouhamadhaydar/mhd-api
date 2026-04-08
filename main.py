@@ -24,7 +24,7 @@ reader = easyocr.Reader(
     download_enabled=True
 )
 
-# ----------------------------
+
 # IMAGE PROCESSING
 # ----------------------------
 def preprocess_image(file_bytes):
