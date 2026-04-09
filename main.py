@@ -3,6 +3,8 @@ from PIL import Image, ImageOps
 import easyocr
 import io
 import os
+import json
+import requests
 import torch
 import numpy as np
 import re
@@ -17,6 +19,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.environ.get("EASYOCR_MODULE_PATH", os.path.join(BASE_DIR, ".EasyOCR"))
 CSV_FILE_PATH = os.path.join(BASE_DIR, "items.csv")
 
+# OpenAI config
+OPENAI_API_KEY = os.environ.get("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", "").strip()
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
+
 reader = easyocr.Reader(
     ['en'],
     gpu=False,
@@ -24,7 +30,7 @@ reader = easyocr.Reader(
     download_enabled=True
 )
 
-
+# ----------------------------
 # IMAGE PROCESSING
 # ----------------------------
 def preprocess_image(file_bytes):
@@ -112,9 +118,9 @@ def detect_expiry_date(raw_text):
     text = str(raw_text)
 
     patterns = [
-        r'\b(20\d{2}-\d{2}-\d{2})\b',                        # 2030-07-31
+        r'\b(20\d{2}-\d{2}-\d{2})\b',
         r'\b(20\d{2}/\d{2}/\d{2})\b',
-        r'\b(0[1-9]|1[0-2])[\/\-](20\d{2})\b',              # 07/2030
+        r'\b(0[1-9]|1[0-2])[\/\-](20\d{2})\b',
         r'\b(0[1-9]|[12][0-9]|3[01])[\/\-](0[1-9]|1[0-2])[\/\-](20\d{2})\b'
     ]
 
@@ -133,7 +139,6 @@ def detect_code_from_text(raw_text):
     gtin = detect_gtin(text)
     expiry = detect_expiry_date(text)
 
-    # Prefer standalone numeric code like 133650
     numeric_candidates = re.findall(r'\b\d{5,10}\b', text)
     for num in numeric_candidates:
         if num == gtin:
@@ -146,7 +151,6 @@ def detect_code_from_text(raw_text):
             continue
         return num
 
-    # Fallback: alphanumeric item codes
     patterns = [
         r'\b([A-Z]{2,10}\.\d{2,10})\b',
         r'\b([A-Z]{1,5}-\d{2,10})\b',
@@ -170,7 +174,7 @@ def detect_batch(raw_text):
 
     labeled_patterns = [
         r'\b(?:LOT|BATCH|LOT NO|LOT NUMBER|BN|LN)[\s:.\-]*([A-Z0-9\-\/]{4,30})\b',
-        r'\(10\)\s*([A-Z0-9\-\/]{4,30})\b'   # GS1 AI (10) batch/lot
+        r'\(10\)\s*([A-Z0-9\-\/]{4,30})\b'
     ]
 
     for pattern in labeled_patterns:
@@ -272,6 +276,210 @@ def find_best_item_match(raw_text, df, code_col, desc_col):
 
     return best_row, best_score, best_type
 
+
+# ----------------------------
+# OPENAI FALLBACK
+# ----------------------------
+def build_candidate_list(df, code_col, desc_col, gtin_col, detected_code, detected_gtin, raw_text, top_n=20):
+    text_clean = clean_text(raw_text)
+    candidates = []
+
+    for _, row in df.iterrows():
+        code_value = str(row[code_col]) if pd.notna(row[code_col]) else ""
+        desc_value = str(row[desc_col]) if desc_col and pd.notna(row[desc_col]) else ""
+        gtin_value = str(row[gtin_col]) if gtin_col and pd.notna(row[gtin_col]) else ""
+
+        combined = f"{code_value} {desc_value} {gtin_value}"
+        combined_clean = clean_text(combined)
+
+        score_code = fuzz.partial_ratio(clean_text(detected_code), clean_text(code_value)) if detected_code and code_value else 0
+        score_gtin = 100 if detected_gtin and gtin_value and detected_gtin == re.sub(r'[^0-9]', '', gtin_value) else 0
+        score_text = fuzz.partial_ratio(text_clean, combined_clean) if combined_clean else 0
+
+        score = max(score_code, score_gtin, score_text)
+
+        candidates.append({
+            "item_code": code_value,
+            "description": desc_value,
+            "gtin": re.sub(r'[^0-9]', '', gtin_value),
+            "score": round(float(score), 2)
+        })
+
+    candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
+    return candidates[:top_n]
+
+
+def extract_text_output_from_responses_api(data):
+    """
+    Best-effort parser for Responses API output.
+    """
+    # Common newer shape
+    if isinstance(data, dict):
+        if isinstance(data.get("output_text"), str) and data["output_text"].strip():
+            return data["output_text"].strip()
+
+        output = data.get("output", [])
+        collected = []
+
+        for item in output:
+            content = item.get("content", [])
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") in ("output_text", "text"):
+                        txt = part.get("text", "")
+                        if txt:
+                            collected.append(txt)
+
+        if collected:
+            return "\n".join(collected).strip()
+
+    return ""
+
+
+def call_openai_product_fallback(raw_text, detected_code, detected_batch, detected_expiry, detected_gtin,
+                                 csv_candidates):
+    if not OPENAI_API_KEY:
+        return {
+            "used": False,
+            "error": "OPENAI_API_KEY is missing"
+        }
+
+    system_prompt = """
+You are helping identify a medical or warehouse product from OCR text.
+
+Return STRICT JSON only with this schema:
+{
+  "matched_item_code": "string",
+  "matched_description": "string",
+  "gtin": "string",
+  "batch": "string",
+  "expiry_date": "string",
+  "confidence": 0,
+  "reason": "string",
+  "is_unknown": false
+}
+
+Rules:
+- Use the OCR text and detected fields carefully.
+- Prefer exact evidence from OCR text.
+- Prefer any candidate whose GTIN exactly matches.
+- If you are not confident, set "is_unknown": true.
+- Do not invent data not supported by OCR text or candidates.
+- confidence must be 0 to 100.
+- Output JSON only, no markdown.
+""".strip()
+
+    user_payload = {
+        "ocr_text": raw_text,
+        "detected_fields": {
+            "detected_code": detected_code,
+            "batch": detected_batch,
+            "expiry_date": detected_expiry,
+            "gtin": detected_gtin
+        },
+        "csv_candidate_matches": csv_candidates
+    }
+
+    body = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)}
+        ],
+        "max_output_tokens": 500
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    resp = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers=headers,
+        json=body,
+        timeout=60
+    )
+
+    resp.raise_for_status()
+    data = resp.json()
+
+    text_output = extract_text_output_from_responses_api(data)
+    if not text_output:
+        return {
+            "used": False,
+            "error": "OpenAI returned no text output",
+            "raw_response": data
+        }
+
+    try:
+        parsed = json.loads(text_output)
+    except Exception:
+        return {
+            "used": False,
+            "error": "OpenAI output was not valid JSON",
+            "raw_text": text_output
+        }
+
+    return {
+        "used": True,
+        "data": parsed
+    }
+
+
+def merge_ai_fallback_result(raw_text, lines, detected_code, detected_batch, detected_expiry, detected_gtin,
+                             ai_result):
+    ai = ai_result.get("data", {}) if isinstance(ai_result, dict) else {}
+
+    ai_item_code = str(ai.get("matched_item_code", "")).strip()
+    ai_description = str(ai.get("matched_description", "")).strip()
+    ai_gtin = str(ai.get("gtin", "")).strip()
+    ai_batch = str(ai.get("batch", "")).strip()
+    ai_expiry = str(ai.get("expiry_date", "")).strip()
+    ai_confidence = ai.get("confidence", 0)
+    ai_reason = str(ai.get("reason", "")).strip()
+    ai_unknown = bool(ai.get("is_unknown", False))
+
+    final_gtin = ai_gtin or detected_gtin
+    final_batch = ai_batch or detected_batch
+    final_expiry = ai_expiry or detected_expiry
+
+    if ai_unknown or (not ai_item_code and not ai_description):
+        return {
+            "success": True,
+            "ocr_text": raw_text,
+            "lines": lines,
+            "detected_code": detected_code,
+            "matched_item_code": "UNKNOWN PRODUCT",
+            "matched_description": "UNKNOWN PRODUCT",
+            "batch": final_batch,
+            "expiry_date": final_expiry,
+            "gtin": final_gtin,
+            "match_score": 0,
+            "match_type": "unknown_product_openai_checked",
+            "openai_used": True,
+            "openai_confidence": ai_confidence,
+            "openai_reason": ai_reason
+        }
+
+    return {
+        "success": True,
+        "ocr_text": raw_text,
+        "lines": lines,
+        "detected_code": detected_code,
+        "matched_item_code": ai_item_code or "UNKNOWN PRODUCT",
+        "matched_description": ai_description or "UNKNOWN PRODUCT",
+        "batch": final_batch,
+        "expiry_date": final_expiry,
+        "gtin": final_gtin,
+        "match_score": float(ai_confidence) if str(ai_confidence).strip() != "" else 0,
+        "match_type": "openai_fallback",
+        "openai_used": True,
+        "openai_confidence": ai_confidence,
+        "openai_reason": ai_reason
+    }
+
+
 # ----------------------------
 # ROUTES
 # ----------------------------
@@ -333,7 +541,6 @@ def match_item():
 
         df, code_col, desc_col, gtin_col = load_items(CSV_FILE_PATH)
 
-        # Minimum fuzzy score to accept a CSV match
         MIN_MATCH_SCORE = 70
 
         # 1) GTIN exact match
@@ -350,7 +557,8 @@ def match_item():
                 "expiry_date": detected_expiry,
                 "gtin": detected_gtin,
                 "match_score": 100.0,
-                "match_type": "gtin_exact"
+                "match_type": "gtin_exact",
+                "openai_used": False
             })
 
         # 2) item code exact match
@@ -367,27 +575,79 @@ def match_item():
                 "expiry_date": detected_expiry,
                 "gtin": detected_gtin,
                 "match_score": 100.0,
-                "match_type": "exact_code"
+                "match_type": "exact_code",
+                "openai_used": False
             })
 
         # 3) fuzzy compare against CSV
         best_row, best_score, best_match_basis = find_best_item_match(raw_text, df, code_col, desc_col)
 
-        # 4) if score too low => unknown product
+        # 4) if score too low => try OpenAI fallback
         if best_row is None or float(best_score) < MIN_MATCH_SCORE:
-            return jsonify({
-                "success": True,
-                "ocr_text": raw_text,
-                "lines": lines,
-                "detected_code": detected_code,
-                "matched_item_code": "UNKNOWN PRODUCT",
-                "matched_description": "UNKNOWN PRODUCT",
-                "batch": detected_batch,
-                "expiry_date": detected_expiry,
-                "gtin": detected_gtin,
-                "match_score": round(float(best_score), 2) if best_row is not None else 0,
-                "match_type": "unknown_product"
-            })
+            candidates = build_candidate_list(
+                df=df,
+                code_col=code_col,
+                desc_col=desc_col,
+                gtin_col=gtin_col,
+                detected_code=detected_code,
+                detected_gtin=detected_gtin,
+                raw_text=raw_text,
+                top_n=20
+            )
+
+            try:
+                ai_result = call_openai_product_fallback(
+                    raw_text=raw_text,
+                    detected_code=detected_code,
+                    detected_batch=detected_batch,
+                    detected_expiry=detected_expiry,
+                    detected_gtin=detected_gtin,
+                    csv_candidates=candidates
+                )
+
+                if ai_result.get("used"):
+                    return jsonify(merge_ai_fallback_result(
+                        raw_text=raw_text,
+                        lines=lines,
+                        detected_code=detected_code,
+                        detected_batch=detected_batch,
+                        detected_expiry=detected_expiry,
+                        detected_gtin=detected_gtin,
+                        ai_result=ai_result
+                    ))
+
+                return jsonify({
+                    "success": True,
+                    "ocr_text": raw_text,
+                    "lines": lines,
+                    "detected_code": detected_code,
+                    "matched_item_code": "UNKNOWN PRODUCT",
+                    "matched_description": "UNKNOWN PRODUCT",
+                    "batch": detected_batch,
+                    "expiry_date": detected_expiry,
+                    "gtin": detected_gtin,
+                    "match_score": round(float(best_score), 2) if best_row is not None else 0,
+                    "match_type": "unknown_product",
+                    "openai_used": False,
+                    "openai_error": ai_result.get("error", "OpenAI fallback failed")
+                })
+
+            except Exception as ai_ex:
+                return jsonify({
+                    "success": True,
+                    "ocr_text": raw_text,
+                    "lines": lines,
+                    "detected_code": detected_code,
+                    "matched_item_code": "UNKNOWN PRODUCT",
+                    "matched_description": "UNKNOWN PRODUCT",
+                    "batch": detected_batch,
+                    "expiry_date": detected_expiry,
+                    "gtin": detected_gtin,
+                    "match_score": round(float(best_score), 2) if best_row is not None else 0,
+                    "match_type": "unknown_product",
+                    "openai_used": False,
+                    "openai_error": str(ai_ex)
+                })
 
         # 5) valid fuzzy match
         matched_item_code = str(best_row[code_col])
@@ -404,13 +664,14 @@ def match_item():
             "expiry_date": detected_expiry,
             "gtin": detected_gtin,
             "match_score": round(float(best_score), 2),
-            "match_type": f"fuzzy_{best_match_basis}"
+            "match_type": f"fuzzy_{best_match_basis}",
+            "openai_used": False
         })
 
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
 # RUN
-# ----------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
