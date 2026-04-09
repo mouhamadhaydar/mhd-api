@@ -8,3 +8,4 @@ numpy
 pandas
 rapidfuzz
 opencv-python-headless
+requests
