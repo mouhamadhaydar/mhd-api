@@ -70,6 +70,47 @@ def clean_text(text):
 
 
 # =========================================================
+# GS1 BARCODE PARSER
+# =========================================================
+def parse_gs1_fields(text):
+    text = str(text).upper()
+
+    result = {
+        "gtin": "",
+        "batch": "",
+        "expiry": ""
+    }
+
+    # normalize spacing around brackets to improve regex hits
+    text = text.replace("(", " (").replace(")", ") ")
+
+    # (01) GTIN - fixed 14 digits
+    m = re.search(r'\(01\)\s*([0-9A-Z]{8,18})', text)
+    if m:
+        gtin_raw = fix_ocr_confusions(m.group(1), "gtin")
+        gtin_raw = re.sub(r'[^0-9]', '', gtin_raw)
+        if len(gtin_raw) in (8, 12, 13, 14):
+            result["gtin"] = gtin_raw
+
+    # (10) Batch/Lot - variable length
+    m = re.search(r'\(10\)\s*([A-Z0-9\-\/]{3,30})', text)
+    if m:
+        # For batch: keep letters, only minimal safe correction
+        result["batch"] = fix_ocr_confusions(m.group(1), "batch")
+
+    # (17) Expiry YYMMDD -> YYYY-MM-DD
+    m = re.search(r'\(17\)\s*(\d{6})', text)
+    if m:
+        raw = m.group(1)
+        year = "20" + raw[:2]
+        month = raw[2:4]
+        day = raw[4:6]
+        result["expiry"] = f"{year}-{month}-{day}"
+
+    return result
+
+
+# =========================================================
 # OCR CONFUSION FIXER
 # =========================================================
 def fix_ocr_confusions(token, field_type="generic"):
@@ -78,14 +119,6 @@ def fix_ocr_confusions(token, field_type="generic"):
 
     if not token:
         return token
-
-    num_to_alpha = {
-        '0': 'O',
-        '1': 'I',
-        '5': 'S',
-        '8': 'B',
-        '2': 'Z'
-    }
 
     alpha_to_num = {
         'O': '0',
@@ -122,6 +155,9 @@ def fix_ocr_confusions(token, field_type="generic"):
         return token
 
     if field_type == "batch":
+        # IMPORTANT:
+        # Do NOT convert letters to numbers for batch
+        # Only apply safe numeric -> alpha correction such as X2348 -> X234B
         fixed = chars[:]
 
         for i, c in enumerate(fixed):
@@ -129,23 +165,18 @@ def fix_ocr_confusions(token, field_type="generic"):
             next_c = fixed[i + 1] if i < len(fixed) - 1 else ''
 
             prev_is_digit = prev_c.isdigit()
-            next_is_digit = next_c.isdigit()
             prev_is_alpha = prev_c.isalpha()
             next_is_alpha = next_c.isalpha()
 
-            # convert numeric-looking chars to letters if batch looks alphanumeric
             if c == '8':
-                if prev_is_digit and (next_is_alpha or next_c == '' or prev_is_alpha):
+                if prev_is_digit and (next_c == '' or next_is_alpha or prev_is_alpha):
                     fixed[i] = 'B'
             elif c == '0':
-                if prev_is_alpha and not next_is_digit:
+                if prev_is_alpha and not next_c.isdigit():
                     fixed[i] = 'O'
             elif c == '1':
-                if prev_is_alpha and not next_is_digit:
+                if prev_is_alpha and not next_c.isdigit():
                     fixed[i] = 'I'
-            elif c in ('O', 'I', 'L', 'S', 'B', 'Z'):
-                if prev_is_digit or next_is_digit:
-                    fixed[i] = alpha_to_num.get(c, c)
 
         return ''.join(fixed)
 
@@ -393,7 +424,8 @@ def validate_expiry(expiry):
         r'20\d{2}[\/\-](0[1-9]|1[0-2])',
         r'(0[1-9]|1[0-2])[\/\-]20\d{2}',
         r'20\d{2}[\/\-](0[1-9]|1[0-2])[\/\-](0[1-9]|[12][0-9]|3[01])',
-        r'(0[1-9]|[12][0-9]|3[01])[\/\-](0[1-9]|1[0-2])[\/\-]20\d{2}'
+        r'(0[1-9]|[12][0-9]|3[01])[\/\-](0[1-9]|1[0-2])[\/\-]20\d{2}',
+        r'20\d{2}\-(0[1-9]|1[0-2])\-(0[1-9]|[12][0-9]|3[01])'
     ]
     for pattern in patterns:
         if re.fullmatch(pattern, expiry):
@@ -498,10 +530,14 @@ def ocr():
 
         raw_text, lines = extract_text_from_bytes(file_bytes)
 
+        # STEP 1: GS1 FIRST
+        gs1 = parse_gs1_fields(raw_text)
+
+        # STEP 2: OCR FALLBACK
+        detected_gtin = gs1["gtin"] or detect_gtin(raw_text)
+        detected_batch = validate_batch(gs1["batch"] or detect_batch(raw_text))
+        detected_expiry = validate_expiry(gs1["expiry"] or detect_expiry_date(raw_text))
         detected_code = detect_code_from_text(raw_text)
-        detected_batch = validate_batch(detect_batch(raw_text))
-        detected_expiry = validate_expiry(detect_expiry_date(raw_text))
-        detected_gtin = detect_gtin(raw_text)
 
         return jsonify({
             "success": True,
@@ -537,10 +573,32 @@ def match_item():
 
         raw_text, lines = extract_text_from_bytes(file_bytes)
 
+        # =========================
+        # STEP 1: GS1 FIRST
+        # =========================
+        gs1 = parse_gs1_fields(raw_text)
+
+        detected_gtin = gs1["gtin"]
+        detected_batch = gs1["batch"]
+        detected_expiry = gs1["expiry"]
+
+        # =========================
+        # STEP 2: OCR FALLBACK
+        # =========================
+        if not detected_gtin:
+            detected_gtin = detect_gtin(raw_text)
+
+        if not detected_batch:
+            detected_batch = validate_batch(detect_batch(raw_text))
+        else:
+            detected_batch = validate_batch(detected_batch)
+
+        if not detected_expiry:
+            detected_expiry = validate_expiry(detect_expiry_date(raw_text))
+        else:
+            detected_expiry = validate_expiry(detected_expiry)
+
         detected_code = detect_code_from_text(raw_text)
-        detected_batch = validate_batch(detect_batch(raw_text))
-        detected_expiry = validate_expiry(detect_expiry_date(raw_text))
-        detected_gtin = detect_gtin(raw_text)
 
         df, code_col, desc_col, gtin_col = load_items(CSV_FILE_PATH)
 
