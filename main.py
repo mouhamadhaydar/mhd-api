@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image, ImageOps
 import easyocr
 import io
 import os
@@ -24,168 +24,32 @@ reader = easyocr.Reader(
     download_enabled=True
 )
 
-# =========================================================
+
 # IMAGE PROCESSING
-# =========================================================
+# ----------------------------
 def preprocess_image(file_bytes):
     img = Image.open(io.BytesIO(file_bytes)).convert("L")
-    img = ImageOps.exif_transpose(img)
     img = ImageOps.autocontrast(img)
-    img = img.filter(ImageFilter.SHARPEN)
-
-    # light threshold to improve printed labels
-    img = img.point(lambda p: 255 if p > 160 else 0)
-
     return np.array(img)
-
 
 def extract_text_from_bytes(file_bytes):
     img = preprocess_image(file_bytes)
+    results = reader.readtext(img, detail=0, paragraph=True)
+    full_text = " ".join(results).strip()
+    return full_text, results
 
-    results = reader.readtext(
-        img,
-        detail=0,
-        paragraph=False,
-        decoder='greedy'
-    )
-
-    cleaned_lines = []
-    for r in results:
-        line = str(r).strip()
-        if line:
-            cleaned_lines.append(line)
-
-    full_text = " ".join(cleaned_lines).strip()
-    return full_text, cleaned_lines
-
-
-# =========================================================
+# ----------------------------
 # CLEAN TEXT
-# =========================================================
+# ----------------------------
 def clean_text(text):
     text = str(text).lower()
-    text = re.sub(r'[^a-z0-9\s./()\-]', ' ', text)
+    text = re.sub(r'[^a-z0-9\s./()-]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-
-# =========================================================
-# GS1 BARCODE PARSER
-# =========================================================
-def parse_gs1_fields(text):
-    text = str(text).upper()
-
-    result = {
-        "gtin": "",
-        "batch": "",
-        "expiry": ""
-    }
-
-    # normalize spacing around brackets to improve regex hits
-    text = text.replace("(", " (").replace(")", ") ")
-
-    # (01) GTIN - fixed 14 digits
-    m = re.search(r'\(01\)\s*([0-9A-Z]{8,18})', text)
-    if m:
-        gtin_raw = fix_ocr_confusions(m.group(1), "gtin")
-        gtin_raw = re.sub(r'[^0-9]', '', gtin_raw)
-        if len(gtin_raw) in (8, 12, 13, 14):
-            result["gtin"] = gtin_raw
-
-    # (10) Batch/Lot - variable length
-    m = re.search(r'\(10\)\s*([A-Z0-9\-\/]{3,30})', text)
-    if m:
-        # For batch: keep letters, only minimal safe correction
-        result["batch"] = fix_ocr_confusions(m.group(1), "batch")
-
-    # (17) Expiry YYMMDD -> YYYY-MM-DD
-    m = re.search(r'\(17\)\s*(\d{6})', text)
-    if m:
-        raw = m.group(1)
-        year = "20" + raw[:2]
-        month = raw[2:4]
-        day = raw[4:6]
-        result["expiry"] = f"{year}-{month}-{day}"
-
-    return result
-
-
-# =========================================================
-# OCR CONFUSION FIXER
-# =========================================================
-def fix_ocr_confusions(token, field_type="generic"):
-    token = str(token).strip().upper()
-    token = re.sub(r'\s+', '', token)
-
-    if not token:
-        return token
-
-    alpha_to_num = {
-        'O': '0',
-        'Q': '0',
-        'D': '0',
-        'I': '1',
-        'L': '1',
-        '|': '1',
-        'S': '5',
-        'B': '8',
-        'Z': '2'
-    }
-
-    chars = list(token)
-
-    if field_type == "gtin":
-        fixed = []
-        for c in chars:
-            fixed.append(alpha_to_num.get(c, c))
-        return ''.join(fixed)
-
-    if field_type == "expiry":
-        fixed = []
-        for c in chars:
-            if c in '/-.':
-                fixed.append(c)
-            else:
-                fixed.append(alpha_to_num.get(c, c))
-        return ''.join(fixed)
-
-    if field_type == "code":
-        # item codes can be numeric or alphanumeric
-        # do not aggressively convert
-        return token
-
-    if field_type == "batch":
-        # IMPORTANT:
-        # Do NOT convert letters to numbers for batch
-        # Only apply safe numeric -> alpha correction such as X2348 -> X234B
-        fixed = chars[:]
-
-        for i, c in enumerate(fixed):
-            prev_c = fixed[i - 1] if i > 0 else ''
-            next_c = fixed[i + 1] if i < len(fixed) - 1 else ''
-
-            prev_is_digit = prev_c.isdigit()
-            prev_is_alpha = prev_c.isalpha()
-            next_is_alpha = next_c.isalpha()
-
-            if c == '8':
-                if prev_is_digit and (next_c == '' or next_is_alpha or prev_is_alpha):
-                    fixed[i] = 'B'
-            elif c == '0':
-                if prev_is_alpha and not next_c.isdigit():
-                    fixed[i] = 'O'
-            elif c == '1':
-                if prev_is_alpha and not next_c.isdigit():
-                    fixed[i] = 'I'
-
-        return ''.join(fixed)
-
-    return token
-
-
-# =========================================================
+# ----------------------------
 # LOAD ITEMS CSV
-# =========================================================
+# ----------------------------
 def load_items(csv_file):
     encodings_to_try = ['utf-8', 'utf-8-sig', 'cp1252', 'latin1']
 
@@ -216,18 +80,10 @@ def load_items(csv_file):
         raise ValueError(f"No item code column found. CSV columns: {list(df.columns)}")
 
     df[code_col] = df[code_col].fillna('').astype(str).str.strip()
-
     if desc_col:
         df[desc_col] = df[desc_col].fillna('').astype(str).str.strip()
-
     if gtin_col:
-        df[gtin_col] = (
-            df[gtin_col]
-            .fillna('')
-            .astype(str)
-            .apply(lambda x: fix_ocr_confusions(x, "gtin"))
-            .str.replace(r'[^0-9]', '', regex=True)
-        )
+        df[gtin_col] = df[gtin_col].fillna('').astype(str).str.replace(r'[^0-9]', '', regex=True)
 
     if desc_col:
         df['combined'] = (
@@ -241,92 +97,44 @@ def load_items(csv_file):
 
     return df, code_col, desc_col, gtin_col
 
-
-# =========================================================
+# ----------------------------
 # DETECT GTIN
-# =========================================================
+# ----------------------------
 def detect_gtin(raw_text):
-    text = str(raw_text).upper()
+    text = re.sub(r'[^0-9]', ' ', str(raw_text))
+    candidates = re.findall(r'\b\d{14}\b|\b\d{13}\b|\b\d{12}\b|\b\d{8}\b', text)
+    return candidates[0] if candidates else ''
 
-    # Try GS1 AI (01) first
-    m = re.search(r'\(01\)\s*([A-Z0-9]{8,18})', text)
-    if m:
-        gtin = fix_ocr_confusions(m.group(1), "gtin")
-        gtin = re.sub(r'[^0-9]', '', gtin)
-        if len(gtin) in (8, 12, 13, 14):
-            return gtin
-
-    # fallback general token scan
-    cleaned = re.sub(r'[^A-Z0-9]', ' ', text)
-    tokens = cleaned.split()
-
-    for token in tokens:
-        fixed = fix_ocr_confusions(token, "gtin")
-        fixed = re.sub(r'[^0-9]', '', fixed)
-        if len(fixed) in (8, 12, 13, 14):
-            return fixed
-
-    return ''
-
-
-# =========================================================
+# ----------------------------
 # DETECT EXPIRY DATE
-# =========================================================
+# ----------------------------
 def detect_expiry_date(raw_text):
-    text = str(raw_text).upper()
+    text = str(raw_text)
 
-    labeled_patterns = [
-        r'\bEXP(?:IRY)?[\s:.-]*(20\d{2}[\/\-](0[1-9]|1[0-2]))\b',
-        r'\bEXP(?:IRY)?[\s:.-]*((0[1-9]|1[0-2])[\/\-]20\d{2})\b',
-        r'\bEXP(?:IRY)?[\s:.-]*(20\d{2}[\/\-](0[1-9]|1[0-2])[\/\-](0[1-9]|[12][0-9]|3[01]))\b',
-        r'\bEXP(?:IRY)?[\s:.-]*((0[1-9]|[12][0-9]|3[01])[\/\-](0[1-9]|1[0-2])[\/\-]20\d{2})\b'
+    patterns = [
+        r'\b(20\d{2}-\d{2}-\d{2})\b',                        # 2030-07-31
+        r'\b(20\d{2}/\d{2}/\d{2})\b',
+        r'\b(0[1-9]|1[0-2])[\/\-](20\d{2})\b',              # 07/2030
+        r'\b(0[1-9]|[12][0-9]|3[01])[\/\-](0[1-9]|1[0-2])[\/\-](20\d{2})\b'
     ]
 
-    for pattern in labeled_patterns:
+    for pattern in patterns:
         m = re.search(pattern, text)
         if m:
-            return fix_ocr_confusions(m.group(1), "expiry")
-
-    generic_patterns = [
-        r'\b(20\d{2}[\/\-](0[1-9]|1[0-2]))\b',
-        r'\b((0[1-9]|1[0-2])[\/\-]20\d{2})\b',
-        r'\b(20\d{2}[\/\-](0[1-9]|1[0-2])[\/\-](0[1-9]|[12][0-9]|3[01]))\b',
-        r'\b((0[1-9]|[12][0-9]|3[01])[\/\-](0[1-9]|1[0-2])[\/\-]20\d{2})\b'
-    ]
-
-    for pattern in generic_patterns:
-        m = re.search(pattern, text)
-        if m:
-            return fix_ocr_confusions(m.group(1), "expiry")
+            return m.group(0)
 
     return ''
 
-
-# =========================================================
+# ----------------------------
 # DETECT ITEM CODE
-# =========================================================
+# ----------------------------
 def detect_code_from_text(raw_text):
     text = str(raw_text).upper()
-
-    # 1) Prefer explicit SKU / ITEM / CODE labels
-    labeled_patterns = [
-        r'\bSKU[\s:.-]*([A-Z0-9.\-]{3,30})\b',
-        r'\bITEM[\s:.-]*([A-Z0-9.\-]{3,30})\b',
-        r'\bITEM\s*CODE[\s:.-]*([A-Z0-9.\-]{3,30})\b',
-        r'\bCODE[\s:.-]*([A-Z0-9.\-]{3,30})\b'
-    ]
-    for pattern in labeled_patterns:
-        m = re.search(pattern, text)
-        if m:
-            return fix_ocr_confusions(m.group(1), "code")
-
     gtin = detect_gtin(text)
     expiry = detect_expiry_date(text)
 
-    # 2) standalone numeric candidates
+    # Prefer standalone numeric code like 133650
     numeric_candidates = re.findall(r'\b\d{5,10}\b', text)
-    skip_values = {'01', '10', '11', '17', '30'}
-
     for num in numeric_candidates:
         if num == gtin:
             continue
@@ -334,16 +142,15 @@ def detect_code_from_text(raw_text):
             continue
         if num.startswith('20'):
             continue
-        if num in skip_values:
+        if num in ('300731', '01', '10', '17'):
             continue
-        return fix_ocr_confusions(num, "code")
+        return num
 
-    # 3) alphanumeric candidates
+    # Fallback: alphanumeric item codes
     patterns = [
         r'\b([A-Z]{2,10}\.\d{2,10})\b',
-        r'\b([A-Z]{1,10}-\d{2,10})\b',
-        r'\b([A-Z]{1,10}\d{2,20})\b',
-        r'\b(\d{2,20}[A-Z]{1,10})\b'
+        r'\b([A-Z]{1,5}-\d{2,10})\b',
+        r'\b([A-Z]{2,10}\d{2,10})\b'
     ]
 
     for pattern in patterns:
@@ -351,91 +158,72 @@ def detect_code_from_text(raw_text):
         if m:
             value = m.group(1)
             if value != gtin:
-                return fix_ocr_confusions(value, "code")
+                return value
 
     return ''
 
-
-# =========================================================
+# ----------------------------
 # DETECT BATCH
-# =========================================================
+# ----------------------------
 def detect_batch(raw_text):
     text = str(raw_text).upper()
 
     labeled_patterns = [
-        r'\b(?:LOT|BATCH|LOT NO|LOT NUMBER|BN|LN)[\s:.\-]*([A-Z0-9\-\/]{3,30})\b',
-        r'\(10\)\s*([A-Z0-9\-\/]{3,30})\b'
+        r'\b(?:LOT|BATCH|LOT NO|LOT NUMBER|BN|LN)[\s:.\-]*([A-Z0-9\-\/]{4,30})\b',
+        r'\(10\)\s*([A-Z0-9\-\/]{4,30})\b'   # GS1 AI (10) batch/lot
     ]
 
     for pattern in labeled_patterns:
         m = re.search(pattern, text)
         if m:
-            return fix_ocr_confusions(m.group(1), "batch")
-
-    tokens = re.findall(r'\b[A-Z0-9.\-\/]{4,30}\b', text)
+            return m.group(1).strip()
 
     detected_code = detect_code_from_text(text)
     detected_gtin = detect_gtin(text)
     detected_expiry = detect_expiry_date(text)
 
+    tokens = re.findall(r'\b[A-Z0-9.\-\/]{4,30}\b', text)
+
     skip_words = {
-        'LOT', 'BATCH', 'EXP', 'MFG', 'SKU', 'QTY', 'NDC',
-        'COVIDIEN', 'SOFSILK', 'RELIAPOINT', 'STAINLESS', 'STEEL',
-        'BOTTLES', 'VIAL', 'VIALS', 'ML'
+        'COVIDIEN', 'SOFSILK', 'RELIAPOINT', 'CUTTING', 'BLACK',
+        'METRIC', 'BRAIDED', 'COATED', 'STAINLESS', 'STEEL',
+        'RAMEEM', 'MEDICA', 'ARABIA', 'KINGDOM', 'SAUDI',
+        'LOT', 'USE', 'BY'
     }
 
+    skip_exact_tokens = {'C-13'}
+
     for token in tokens:
-        token_fixed = fix_ocr_confusions(token, "batch")
-
-        if token_fixed in skip_words:
+        if token in skip_words or token in skip_exact_tokens:
             continue
-        if token_fixed == detected_code or token_fixed == detected_gtin or token_fixed == detected_expiry:
-            continue
-        if re.fullmatch(r'\d{8,14}', token_fixed):
-            continue
-        if re.fullmatch(r'20\d{2}[\/\-](0[1-9]|1[0-2])', token_fixed):
-            continue
-        if re.fullmatch(r'(0[1-9]|1[0-2])[\/\-]20\d{2}', token_fixed):
+        if token == detected_code or token == detected_gtin or token == detected_expiry:
             continue
 
-        if len(token_fixed) >= 4 and re.search(r'[A-Z]', token_fixed) and re.search(r'\d', token_fixed):
-            return token_fixed
+        if re.fullmatch(r'\d{8,14}', token):
+            continue
+        if re.fullmatch(r'20\d{2}-\d{2}-\d{2}', token):
+            continue
+        if re.fullmatch(r'[A-Z]{2,10}\.\d{2,10}', token):
+            continue
+        if re.fullmatch(r'[A-Z]{1,5}-\d{2,10}', token):
+            continue
+        if re.fullmatch(r'[A-Z]{2,10}\d{2,10}', token):
+            continue
+        if re.fullmatch(r'\d+(\.\d+)?(MM|CM|M)?', token):
+            continue
+        if re.fullmatch(r'\d+/\d+', token):
+            continue
+        if re.fullmatch(r'[A-Z]-\d{1,3}', token):
+            continue
+
+        if len(token) >= 5 and re.search(r'[A-Z]', token) and re.search(r'\d', token):
+            return token
 
     return ''
 
-
-# =========================================================
-# VALIDATORS
-# =========================================================
-def validate_batch(batch):
-    if not batch:
-        return ''
-    batch = str(batch).strip().upper()
-    if re.fullmatch(r'[A-Z0-9\-\/]{3,30}', batch):
-        return batch
-    return ''
-
-
-def validate_expiry(expiry):
-    if not expiry:
-        return ''
-    expiry = str(expiry).strip()
-    patterns = [
-        r'20\d{2}[\/\-](0[1-9]|1[0-2])',
-        r'(0[1-9]|1[0-2])[\/\-]20\d{2}',
-        r'20\d{2}[\/\-](0[1-9]|1[0-2])[\/\-](0[1-9]|[12][0-9]|3[01])',
-        r'(0[1-9]|[12][0-9]|3[01])[\/\-](0[1-9]|1[0-2])[\/\-]20\d{2}',
-        r'20\d{2}\-(0[1-9]|1[0-2])\-(0[1-9]|[12][0-9]|3[01])'
-    ]
-    for pattern in patterns:
-        if re.fullmatch(pattern, expiry):
-            return expiry
-    return ''
-
-
-# =========================================================
+# ----------------------------
 # MATCHING
-# =========================================================
+# ----------------------------
 def find_exact_code_match(detected_code, df, code_col):
     if not detected_code:
         return None
@@ -444,7 +232,6 @@ def find_exact_code_match(detected_code, df, code_col):
         return matches.iloc[0]
     return None
 
-
 def find_exact_gtin_match(detected_gtin, df, gtin_col):
     if not detected_gtin or not gtin_col:
         return None
@@ -452,7 +239,6 @@ def find_exact_gtin_match(detected_gtin, df, gtin_col):
     if not matches.empty:
         return matches.iloc[0]
     return None
-
 
 def find_best_item_match(raw_text, df, code_col, desc_col):
     text_clean = clean_text(raw_text)
@@ -477,7 +263,6 @@ def find_best_item_match(raw_text, df, code_col, desc_col):
         if row_best_score > best_score:
             best_score = row_best_score
             best_row = row
-
             if row_best_score == score_code:
                 best_type = "code"
             elif row_best_score == score_desc:
@@ -487,34 +272,12 @@ def find_best_item_match(raw_text, df, code_col, desc_col):
 
     return best_row, best_score, best_type
 
-
-# =========================================================
-# BUILD RESPONSE
-# =========================================================
-def build_response_payload(raw_text, lines, detected_code, detected_batch, detected_expiry, detected_gtin,
-                           matched_item_code="", matched_description="", match_score=0, match_type="none"):
-    return {
-        "success": True,
-        "ocr_text": raw_text,
-        "lines": lines,
-        "detected_code": detected_code,
-        "matched_item_code": matched_item_code,
-        "matched_description": matched_description,
-        "batch": detected_batch,
-        "expiry_date": detected_expiry,
-        "gtin": detected_gtin,
-        "match_score": round(float(match_score), 2) if match_score is not None else 0,
-        "match_type": match_type
-    }
-
-
-# =========================================================
+# ----------------------------
 # ROUTES
-# =========================================================
+# ----------------------------
 @app.route("/")
 def home():
     return "OCR + Item Match API is running"
-
 
 @app.route("/ocr", methods=["POST"])
 def ocr():
@@ -530,28 +293,18 @@ def ocr():
 
         raw_text, lines = extract_text_from_bytes(file_bytes)
 
-        # STEP 1: GS1 FIRST
-        gs1 = parse_gs1_fields(raw_text)
-
-        # STEP 2: OCR FALLBACK
-        detected_gtin = gs1["gtin"] or detect_gtin(raw_text)
-        detected_batch = validate_batch(gs1["batch"] or detect_batch(raw_text))
-        detected_expiry = validate_expiry(gs1["expiry"] or detect_expiry_date(raw_text))
-        detected_code = detect_code_from_text(raw_text)
-
         return jsonify({
             "success": True,
             "text": raw_text,
             "lines": lines,
-            "detected_code": detected_code,
-            "batch": detected_batch,
-            "expiry_date": detected_expiry,
-            "gtin": detected_gtin
+            "detected_code": detect_code_from_text(raw_text),
+            "batch": detect_batch(raw_text),
+            "expiry_date": detect_expiry_date(raw_text),
+            "gtin": detect_gtin(raw_text)
         })
 
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-
 
 @app.route("/match-item", methods=["POST"])
 def match_item():
@@ -573,111 +326,91 @@ def match_item():
 
         raw_text, lines = extract_text_from_bytes(file_bytes)
 
-        # =========================
-        # STEP 1: GS1 FIRST
-        # =========================
-        gs1 = parse_gs1_fields(raw_text)
-
-        detected_gtin = gs1["gtin"]
-        detected_batch = gs1["batch"]
-        detected_expiry = gs1["expiry"]
-
-        # =========================
-        # STEP 2: OCR FALLBACK
-        # =========================
-        if not detected_gtin:
-            detected_gtin = detect_gtin(raw_text)
-
-        if not detected_batch:
-            detected_batch = validate_batch(detect_batch(raw_text))
-        else:
-            detected_batch = validate_batch(detected_batch)
-
-        if not detected_expiry:
-            detected_expiry = validate_expiry(detect_expiry_date(raw_text))
-        else:
-            detected_expiry = validate_expiry(detected_expiry)
-
         detected_code = detect_code_from_text(raw_text)
+        detected_batch = detect_batch(raw_text)
+        detected_expiry = detect_expiry_date(raw_text)
+        detected_gtin = detect_gtin(raw_text)
 
         df, code_col, desc_col, gtin_col = load_items(CSV_FILE_PATH)
 
+        # Minimum fuzzy score to accept a CSV match
         MIN_MATCH_SCORE = 70
 
         # 1) GTIN exact match
         gtin_row = find_exact_gtin_match(detected_gtin, df, gtin_col)
         if gtin_row is not None:
-            return jsonify(build_response_payload(
-                raw_text=raw_text,
-                lines=lines,
-                detected_code=detected_code,
-                detected_batch=detected_batch,
-                detected_expiry=detected_expiry,
-                detected_gtin=detected_gtin,
-                matched_item_code=str(gtin_row[code_col]),
-                matched_description=str(gtin_row[desc_col]) if desc_col else "",
-                match_score=100.0,
-                match_type="gtin_exact"
-            ))
+            return jsonify({
+                "success": True,
+                "ocr_text": raw_text,
+                "lines": lines,
+                "detected_code": detected_code,
+                "matched_item_code": str(gtin_row[code_col]),
+                "matched_description": str(gtin_row[desc_col]) if desc_col else "",
+                "batch": detected_batch,
+                "expiry_date": detected_expiry,
+                "gtin": detected_gtin,
+                "match_score": 100.0,
+                "match_type": "gtin_exact"
+            })
 
-        # 2) Item code exact match
+        # 2) item code exact match
         exact_row = find_exact_code_match(detected_code, df, code_col)
         if exact_row is not None:
-            return jsonify(build_response_payload(
-                raw_text=raw_text,
-                lines=lines,
-                detected_code=detected_code,
-                detected_batch=detected_batch,
-                detected_expiry=detected_expiry,
-                detected_gtin=detected_gtin,
-                matched_item_code=str(exact_row[code_col]),
-                matched_description=str(exact_row[desc_col]) if desc_col else "",
-                match_score=100.0,
-                match_type="exact_code"
-            ))
+            return jsonify({
+                "success": True,
+                "ocr_text": raw_text,
+                "lines": lines,
+                "detected_code": detected_code,
+                "matched_item_code": str(exact_row[code_col]),
+                "matched_description": str(exact_row[desc_col]) if desc_col else "",
+                "batch": detected_batch,
+                "expiry_date": detected_expiry,
+                "gtin": detected_gtin,
+                "match_score": 100.0,
+                "match_type": "exact_code"
+            })
 
-        # 3) fuzzy match
+        # 3) fuzzy compare against CSV
         best_row, best_score, best_match_basis = find_best_item_match(raw_text, df, code_col, desc_col)
 
-        # 4) unknown if low score
+        # 4) if score too low => unknown product
         if best_row is None or float(best_score) < MIN_MATCH_SCORE:
-            return jsonify(build_response_payload(
-                raw_text=raw_text,
-                lines=lines,
-                detected_code=detected_code,
-                detected_batch=detected_batch,
-                detected_expiry=detected_expiry,
-                detected_gtin=detected_gtin,
-                matched_item_code="UNKNOWN PRODUCT",
-                matched_description="UNKNOWN PRODUCT",
-                match_score=round(float(best_score), 2) if best_row is not None else 0,
-                match_type="unknown_product"
-            ))
+            return jsonify({
+                "success": True,
+                "ocr_text": raw_text,
+                "lines": lines,
+                "detected_code": detected_code,
+                "matched_item_code": "UNKNOWN PRODUCT",
+                "matched_description": "UNKNOWN PRODUCT",
+                "batch": detected_batch,
+                "expiry_date": detected_expiry,
+                "gtin": detected_gtin,
+                "match_score": round(float(best_score), 2) if best_row is not None else 0,
+                "match_type": "unknown_product"
+            })
 
         # 5) valid fuzzy match
         matched_item_code = str(best_row[code_col])
         matched_description = str(best_row[desc_col]) if desc_col else ""
 
-        return jsonify(build_response_payload(
-            raw_text=raw_text,
-            lines=lines,
-            detected_code=detected_code,
-            detected_batch=detected_batch,
-            detected_expiry=detected_expiry,
-            detected_gtin=detected_gtin,
-            matched_item_code=matched_item_code,
-            matched_description=matched_description,
-            match_score=best_score,
-            match_type=f"fuzzy_{best_match_basis}"
-        ))
+        return jsonify({
+            "success": True,
+            "ocr_text": raw_text,
+            "lines": lines,
+            "detected_code": detected_code,
+            "matched_item_code": matched_item_code,
+            "matched_description": matched_description,
+            "batch": detected_batch,
+            "expiry_date": detected_expiry,
+            "gtin": detected_gtin,
+            "match_score": round(float(best_score), 2),
+            "match_type": f"fuzzy_{best_match_basis}"
+        })
 
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-
-
-# =========================================================
 # RUN
-# =========================================================
+# ----------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
