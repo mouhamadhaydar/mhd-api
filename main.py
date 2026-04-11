@@ -11,7 +11,6 @@ from rapidfuzz import fuzz
 from pyzbar.pyzbar import decode as zbar_decode
 
 app = Flask(__name__)
-
 torch.set_num_threads(1)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
