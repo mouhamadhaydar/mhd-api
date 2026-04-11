@@ -2,10 +2,11 @@ flask
 gunicorn
 pillow
 easyocr
-torch
-torchvision
 numpy
 pandas
 rapidfuzz
 opencv-python-headless
 pyzbar
+torch==2.2.2+cpu
+torchvision==0.17.2+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
